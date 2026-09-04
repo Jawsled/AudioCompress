@@ -16,6 +16,13 @@ ffmpeg re-encodes or drops the cover when targeting Opus/Ogg (cover goes from
 an attached picture stream to a base64 `METADATA_BLOCK_PICTURE` comment), and
 `-map_metadata` copies incompatible/bloated tags.
 
+## Features
+- Based on ffmpeg we all known and love
+- Compress auido and cover sepratedly and merge them together at the end.
+- Respects your parent-children file structure. the input folder and output folder and filenames should be exactly matched except for the file extension.
+- Easy and intuitive to use Qt6 based optional GUI (tk fallback available if Qt is not available)
+- Easy to select which tags to remain and which one to remove.
+
 ## How it works
 
 1. **Probe:** streams/tags/cover (ffprobe + mutagen, read-only).
@@ -109,12 +116,11 @@ As for quality preset, I would recommend not going below 90%. I find 93 or 95 % 
 
 ## Audio output and size table
 
-`ffmpeg
--vn -map_metadata -1 -map 0:a:0` (the same flags `audiocompress` uses), so
+The test was conducted using a 2:22 16bit/44.1Khz FLAC track. (16.31 MB, ~961 kbps average).
+
+`ffmpeg -vn -map_metadata -1 -map 0:a:0` (the same flags `audiocompress` uses), so
 the numbers match what the tool actually produces. Multiply `KB / min`
 by your track length in minutes to estimate any file.
-
-The test source was a 2:22 FLAC track. (16.31 MB, ~961 kbps average).
 
 ### OPUS
 
@@ -164,4 +170,3 @@ Pick it only if you must.
 - `src/audiocompress/` — `probe`, `extract`, `transcode`, `cover`, `remux`,
   `pipeline`, `cli`, `gui`, `ffmpeg_bin`, `settings`, `metadata_map`
 - `tests/` — cover presets, tag filtering, end-to-end FLAC→Opus (`pytest`)
->>>>>>> bdad32d (innitial commit)
