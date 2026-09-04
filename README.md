@@ -39,10 +39,8 @@ an attached picture stream to a base64 `METADATA_BLOCK_PICTURE` comment), and
 git clone https://github.com/Jawsled/AudioCompress.git
 cd AudioCompress
 
-python audiocompress.py batch --help   # creates venv on the first run
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -e ".[dev]"
+python run.py batch --help    # creates .venv on first run
+python run.py gui             # GUI (Qt, auto-installs PySide6; tkinter fallback)
 ```
 **Note:** Requires `ffmpeg`/`ffprobe` on PATH. otherwise the bundled
 `imageio-ffmpeg` binary is used for transcoding.
@@ -51,11 +49,11 @@ pip install -e ".[dev]"
 ## Usage (CLI)
 
 ```
-python audiocompress.py file in.flac out.opus --cover-size 800
-python audiocompress.py batch .\in .\out --format opus --bitrate 160 --cover-size 500
-python audiocompress.py batch .\in .\out --format mp3 --bitrate 320
-python audiocompress.py batch .\in .\out --format ogg --dry-run
-python audiocompress.py tags .\in   # show which tags your files have
+python run.py file in.flac out.opus --cover-size 800
+python run.py batch .\in .\out --format opus --bitrate 160 --cover-size 500
+python run.py batch .\in .\out --format mp3 --bitrate 320
+python run.py batch .\in .\out --format ogg --dry-run
+python run.py tags .\in   # show which tags your files have
 ```
 
 Defaults: `--format opus`, `--bitrate 160` (32–320), `--cover-size 1000`
@@ -67,9 +65,8 @@ unless `--overwrite`.
 
 ## GUI
 
-```powershell
-pip install -e ".[dev,gui]"   # adds PySide6 for the Qt GUI
-python audiocompress.py gui       # Qt GUI when installed, tkinter fallback otherwise
+```
+python run.py gui              # launches Qt GUI (auto-installed) or tkinter fallback
 ```
 
 No extra build step: pick a source file/folder, a destination
@@ -166,7 +163,7 @@ Pick it only if you must.
 
 ## Layout
 
-- `audiocompress.py` — venv auto-setup + CLI launcher
+- `run.py` — cross-platform launcher: creates `.venv` on first run, then runs the CLI (or GUI via `run.py gui`)
 - `src/audiocompress/` — `probe`, `extract`, `transcode`, `cover`, `remux`,
   `pipeline`, `cli`, `gui`, `ffmpeg_bin`, `settings`, `metadata_map`
 - `tests/` — cover presets, tag filtering, end-to-end FLAC→Opus (`pytest`)

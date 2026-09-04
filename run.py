@@ -1,11 +1,11 @@
-"""Bootstrap launcher: ensures an isolated project venv exists, then runs the CLI.
+"""Bootstrap launcher: ensures an isolated project venv exists, then runs CLI.
 
 Cross-platform (Windows/macOS/Linux, stdlib only). Usage:
-    python audiocompress.py batch ./in ./out --cover-size 800
-    python audiocompress.py file in.flac out.opus
-    python audiocompress.py gui
-Equivalent to activating .venv and running `audiocompress ...`, but the
-venv is created and installed automatically on first run.
+    python run.py batch ./in ./out --cover-size 800
+    python run.py file in.flac out.opus
+    python run.py gui
+With no arguments, defaults to `--help`. The venv is created and installed
+automatically on first run; `gui` additionally ensures PySide6 is available.
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ def ensure_venv() -> Path:
     if not py.exists():
         print(f"[bootstrap] creating isolated venv at {VENV_DIR} ...")
         venv.create(VENV_DIR, with_pip=True)
-    # (Re)install only if audiocompress is missing or pyproject is newer.
     check = subprocess.run(
         [str(py), "-c", "import audiocompress"],
         capture_output=True,
@@ -62,20 +61,36 @@ def ensure_venv() -> Path:
     return py
 
 
+def _ensure_qt(py: Path) -> bool:
+    if subprocess.run(
+        [str(py), "-c", "import PySide6"],
+        capture_output=True,
+        cwd=ROOT,
+    ).returncode == 0:
+        return True
+    print("[bootstrap] PySide6 not installed, installing ...")
+    proc = subprocess.run(
+        [str(py), "-m", "pip", "install", "PySide6"],
+        cwd=ROOT,
+    )
+    return proc.returncode == 0
+
+
+def _gui_module(py: Path) -> str:
+    if _ensure_qt(py):
+        return "audiocompress.gui_qt"
+    print(
+        "[bootstrap] PySide6 install failed, falling back to tkinter GUI."
+    )
+    return "audiocompress.gui"
+
+
 def main(argv: list[str]) -> int:
     py = ensure_venv()
     if not argv:
         argv = ["--help"]
-    if argv[0] == "gui":  # python audiocompress.py gui -> Qt GUI, tkinter fallback
-        has_qt = subprocess.run(
-            [str(py), "-c", "import PySide6"],
-            capture_output=True,
-            cwd=ROOT,
-        ).returncode == 0
-        module = "audiocompress.gui_qt" if has_qt else "audiocompress.gui"
-        if not has_qt:
-            print('[bootstrap] PySide6 not installed, using tkinter fallback. '
-                  'Run `pip install -e ".[gui]"` for the Qt GUI.')
+    if argv[0] == "gui":
+        module = _gui_module(py)
         proc = subprocess.run([str(py), "-m", module], cwd=ROOT)
         return proc.returncode
     proc = subprocess.run([str(py), "-m", "audiocompress.cli", *argv], cwd=ROOT)
