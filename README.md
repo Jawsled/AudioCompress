@@ -33,6 +33,9 @@ an attached picture stream to a base64 `METADATA_BLOCK_PICTURE` comment), and
 ## Quick start
 
 ```
+git clone https://github.com/Jawsled/AudioCompress.git
+cd AudioCompress
+
 python audiocompress.py batch --help   # creates venv on the first run
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
