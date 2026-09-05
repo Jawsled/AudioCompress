@@ -7,14 +7,22 @@ from typing import Optional
 
 import typer
 from rich.console import Console
-from rich.progress import track
+from rich.progress import Progress
 from rich.table import Table
 
 from . import settings
 from .cover import COVER_PRESETS
 from .extract import collect_tag_summary
 from .metadata_map import DEFAULT_KEEP, friendly_label
-from .pipeline import JobConfig, compress_batch, compress_one, iter_inputs
+from .pipeline import (
+    JobConfig,
+    compress_batch,
+    compress_one,
+    copy_sidecars,
+    default_jobs,
+    iter_inputs,
+    iter_sidecars,
+)
 from .probe import probe
 
 app = typer.Typer(add_completion=False, help="Compress audio, preserve cover art.")
@@ -31,13 +39,17 @@ KeepOpt = typer.Option(None, "--keep", help="Comma-separated tags to keep (overr
 DropOpt = typer.Option(None, "--drop", help="Comma-separated tags to drop.")
 OverwriteOpt = typer.Option(False, "--overwrite/--no-overwrite", help="Overwrite existing outputs.")
 DryRunOpt = typer.Option(False, "--dry-run", help="Probe only, transcode nothing.")
+EmbedLrcOpt = typer.Option(None, "--embed-lrc/--no-embed-lrc", help="Embed same-stem .lrc into lyrics tag instead of copying the file.")
+EmbedTxtOpt = typer.Option(None, "--embed-txt/--no-embed-txt", help="Embed same-stem .txt into comment tag instead of copying the file.")
+JobsOpt = typer.Option(None, "--jobs", "-j", help="Parallel workers for batch (default: CPU count, max 8).")
 
 
 def _parse_csv(v: Optional[str]) -> Optional[list[str]]:
     return [s.strip() for s in v.split(",") if s.strip()] if v else None
 
 
-def _cfg(fmt, bitrate, cover_size, cover_quality, keep_all, keep, drop) -> JobConfig:
+def _cfg(fmt, bitrate, cover_size, cover_quality, keep_all, keep, drop,
+         embed_lrc=None, embed_txt=None) -> JobConfig:
     saved = settings.load()
     fmt = (fmt or saved.get("format", "opus")).lower().lstrip(".")
     if fmt not in ("opus", "ogg", "mp3"):
@@ -51,6 +63,10 @@ def _cfg(fmt, bitrate, cover_size, cover_quality, keep_all, keep, drop) -> JobCo
     cover_quality = int(cover_quality if cover_quality is not None else saved.get("cover_quality", 93))
     keep_list = _parse_csv(keep) if keep is not None else saved.get("keep")
     drop_list = _parse_csv(drop) if drop is not None else saved.get("drop")
+    if embed_lrc is None:
+        embed_lrc = bool(saved.get("embed_lrc", False))
+    if embed_txt is None:
+        embed_txt = bool(saved.get("embed_txt", False))
     return JobConfig(
         fmt=fmt,
         bitrate_kbps=bitrate,
@@ -59,20 +75,34 @@ def _cfg(fmt, bitrate, cover_size, cover_quality, keep_all, keep, drop) -> JobCo
         keep_all=keep_all,
         keep=keep_list,
         drop=drop_list,
+        embed_lrc=bool(embed_lrc),
+        embed_txt=bool(embed_txt),
     )
 
 
-def _remember(cfg: JobConfig, dst_dir: Path) -> None:
+def _jobs(jobs) -> int:
+    saved = settings.load()
+    if jobs is None:
+        jobs = saved.get("jobs")
+    return default_jobs(jobs)
+
+
+def _remember(cfg: JobConfig, dst_dir: Path, jobs: int | None = None) -> None:
     """Persist last-used options so CLI and GUI pick them up next time."""
-    settings.save({
+    patch: dict = {
         "format": cfg.fmt,
         "bitrate_kbps": cfg.bitrate_kbps,
         "cover_max_edge": cfg.cover_max_edge,
         "cover_quality": cfg.cover_quality,
         "keep": cfg.keep,
         "drop": cfg.drop,
+        "embed_lrc": cfg.embed_lrc,
+        "embed_txt": cfg.embed_txt,
         "dst_dir": str(dst_dir),
-    })
+    }
+    if jobs is not None:
+        patch["jobs"] = jobs
+    settings.save(patch)
 
 
 @app.command()
@@ -86,10 +116,13 @@ def file(
     keep_all: bool = KeepAllOpt,
     keep: Optional[str] = KeepOpt,
     drop: Optional[str] = DropOpt,
+    embed_lrc: Optional[bool] = EmbedLrcOpt,
+    embed_txt: Optional[bool] = EmbedTxtOpt,
     dry_run: bool = DryRunOpt,
 ):
     """Compress a single file."""
-    cfg = _cfg(fmt, bitrate, cover_size, cover_quality, keep_all, keep, drop)
+    cfg = _cfg(fmt, bitrate, cover_size, cover_quality, keep_all, keep, drop,
+               embed_lrc, embed_txt)
     info = probe(src)
     console.print(
         f"[dim]in:[/] {info.audio_codec} "
@@ -100,11 +133,16 @@ def file(
     if dry_run:
         console.print("[yellow]dry-run: nothing written.[/]")
         return
-    res = compress_one(src, dst, cfg)
+    res = compress_one(src, dst, cfg, overwrite_sidecars=True)
     _remember(cfg, Path(dst).parent)
-    console.print(
+    parts = [
         f"[green]done[/] {res.in_bytes//1024}KB -> {res.out_bytes//1024}KB | cover: {res.cover_note}"
-    )
+    ]
+    if res.sidecar_note:
+        parts.append(f"embedded: {res.sidecar_note}")
+    if res.warnings:
+        parts.append(f"[yellow]audio warning: {res.warnings}[/]")
+    console.print(" | ".join(parts))
 
 
 @app.command()
@@ -118,13 +156,23 @@ def batch(
     keep_all: bool = KeepAllOpt,
     keep: Optional[str] = KeepOpt,
     drop: Optional[str] = DropOpt,
+    embed_lrc: Optional[bool] = EmbedLrcOpt,
+    embed_txt: Optional[bool] = EmbedTxtOpt,
     overwrite: bool = OverwriteOpt,
     dry_run: bool = DryRunOpt,
+    jobs: Optional[int] = JobsOpt,
 ):
     """Compress a whole folder."""
-    cfg = _cfg(fmt, bitrate, cover_size, cover_quality, keep_all, keep, drop)
+    from rich.progress import Progress
+
+    cfg = _cfg(fmt, bitrate, cover_size, cover_quality, keep_all, keep, drop,
+               embed_lrc, embed_txt)
+    n_jobs = _jobs(jobs)
     files = iter_inputs(src_dir)
-    console.print(f"found {len(files)} file(s) -> .{cfg.fmt} @ {cfg.bitrate_kbps}kbps, cover<={cfg.cover_max_edge or 'orig'}px")
+    sidecars = iter_sidecars(src_dir)
+    console.print(f"found {len(files)} file(s) -> .{cfg.fmt} @ {cfg.bitrate_kbps}kbps, cover<={cfg.cover_max_edge or 'orig'}px"
+                  + (f" (+{len(sidecars)} sidecar .lrc/.txt)" if sidecars else "")
+                  + f" [{n_jobs} workers]")
     if dry_run:
         table = Table("input", "codec", "cover")
         for f in files[:50]:
@@ -134,22 +182,41 @@ def batch(
                 f"{info.cover_width}x{info.cover_height}" if info.has_cover else "-",
             )
         console.print(table)
+        if sidecars:
+            console.print(f"[dim]{len(sidecars)} sidecar file(s) (.lrc/.txt) would be copied.[/]")
         return
-    results = []
-    for src in track(files, description="compressing"):
-        rel = src.relative_to(src_dir) if src_dir.is_dir() else Path(src.name)
-        dst = (dst_dir / rel).with_suffix(f".{cfg.fmt}")
-        if dst.exists() and not overwrite:
-            continue
-        results.append(compress_one(src, dst, cfg))
+    skip: set[str] = set()
+    if cfg.embed_lrc:
+        skip.add(".lrc")
+    if cfg.embed_txt:
+        skip.add(".txt")
+    with Progress(transient=True) as progress:
+        task = progress.add_task("compressing", total=len(files))
+        results = compress_batch(
+            src_dir, dst_dir, cfg, overwrite=overwrite, with_sidecars=False,
+            jobs=n_jobs, progress_cb=lambda _d, _t: progress.update(task, completed=_d),
+        )
+    warned = sum(1 for r in results if r.warnings)
+    embedded = sum(1 for r in results if r.sidecar_note)
+    copied = copy_sidecars(src_dir, dst_dir, overwrite=overwrite, skip_suffixes=skip)
     if results:
-        _remember(cfg, dst_dir)
-        table = Table("file", "in", "out", "cover")
+        _remember(cfg, dst_dir, n_jobs)
+        table = Table("file", "in", "out", "cover", "warning")
         for r in results:
-            table.add_row(r.dst.name, f"{r.in_bytes//1024}KB", f"{r.out_bytes//1024}KB", r.cover_note)
+            warn_cells = "; ".join(s for s in (r.warnings, r.sidecar_note) if s) or "-"
+            table.add_row(r.dst.name, f"{r.in_bytes//1024}KB", f"{r.out_bytes//1024}KB", r.cover_note, warn_cells)
         console.print(table)
+        if warned:
+            console.print(
+                f"[yellow]{warned} file(s) had audio decode warnings "
+                f"(corrupt source frames concealed — output may glitch).[/]"
+            )
+        if embedded:
+            console.print(f"[dim]{embedded} file(s) embedded sidecar text.[/]")
     else:
         console.print("[yellow]nothing to do (all outputs exist, use --overwrite).[/]")
+    if copied:
+        console.print(f"[dim]copied {len(copied)} sidecar file(s) (.lrc/.txt).[/]")
 
 
 @app.command()

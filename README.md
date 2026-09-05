@@ -1,9 +1,9 @@
-# Audiocompress
+# AudioCompress
 
 Compress high-bitrate audio (FLAC/WAV/ALAC…) to manageable Opus/Ogg/MP3
 files with tag selection and not ruining the cover art quality.
 
-## Why compress the perfectly good High-bitrate audio?
+## Why compress perfectly good High-bitrate audio files?
 
 Like everyone, I enjoy listening to music all the time - and as  great as high-res audio are, the size is  always a big catch. If I'm listening to music while I'm in a car going somehwere or just out and  about, I don't need higheset quality audio, and my phone / DAP storage agree. Compressing the  audio  file that you arealdy have is a great way to reduce storage space that it occupies on your device, especially on space-constrained situation like on a mobile devices.
 
@@ -20,8 +20,11 @@ an attached picture stream to a base64 `METADATA_BLOCK_PICTURE` comment), and
 - Based on ffmpeg we all known and love
 - Compress auido and cover sepratedly and merge them together at the end.
 - Respects your parent-children file structure. the input folder and output folder and filenames should be exactly matched except for the file extension.
-- Easy and intuitive to use Qt6 based optional GUI (tk fallback available if Qt is not available)
-- Easy to select which tags to remain and which one to remove.
+- Copies over .lrc and .txt files for lyrics, and ifyou wish you can embed them into the converted files directry.
+- Configurable multi-thread conversion (1-32 workers)
+- Easy and intuitive to use Qt6 based optional GUI (tk fallback available if Qt is not available).
+- Easy to select which tags to remain and which one to remove - Even if you select options to retain tags, ffmpeg will drop most of the tags. here, not so. you can retain any tag, discard any tag you wish.
+- Remembers your last used setting
 
 ## How it works
 
@@ -160,6 +163,10 @@ Pick OGG only if you need a player that doesn't support Opus.
 
 MP3 needs ~100% more bitrate than Opus, ~40% more than Vorbis OGG.
 Pick it only if you must.
+
+## Performance
+My test run with about 3000 flac files opus conversion, there were not noticeable hiccups or slowdown.
+You are aslo able to increase the number of pararelle processing (workers) up to 32.
 
 ## Layout
 

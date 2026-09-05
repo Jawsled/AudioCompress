@@ -19,7 +19,7 @@ from . import settings
 from .cover import COVER_PRESETS
 from .extract import collect_tag_summary
 from .metadata_map import DEFAULT_KEEP, friendly_label
-from .pipeline import JobConfig, compress_one, iter_inputs
+from .pipeline import JobConfig, compress_one, copy_sidecars, default_jobs, iter_inputs
 from .probe import probe
 
 COVER_LABELS = ["Original (keep bytes)", *[str(p) for p in sorted(COVER_PRESETS)]]
@@ -118,6 +118,21 @@ class App(ttk.Frame):
         self.overwrite_var = tk.BooleanVar(value=bool(self._saved.get("overwrite", False)))
         ttk.Checkbutton(opts, text="Overwrite existing", variable=self.overwrite_var).grid(
             row=3, column=3, sticky="w")
+
+        ttk.Label(opts, text="Sidecars:").grid(row=4, column=0, sticky="w")
+        self.embed_lrc_var = tk.BooleanVar(value=bool(self._saved.get("embed_lrc", False)))
+        ttk.Checkbutton(opts, text="Embed .lrc → lyrics", variable=self.embed_lrc_var).grid(
+            row=4, column=1, sticky="w")
+        self.embed_txt_var = tk.BooleanVar(value=bool(self._saved.get("embed_txt", False)))
+        ttk.Checkbutton(opts, text="Embed .txt → comment", variable=self.embed_txt_var).grid(
+            row=4, column=2, sticky="w")
+        # Workers label directly left of its number: parallel files at once.
+        workers_frame = ttk.Frame(opts)
+        workers_frame.grid(row=4, column=3, sticky="w")
+        ttk.Label(workers_frame, text="Workers:").pack(side="left")
+        self.jobs_var = tk.IntVar(value=int(self._saved.get("jobs", default_jobs())))
+        ttk.Spinbox(workers_frame, from_=1, to=32, textvariable=self.jobs_var, width=5).pack(
+            side="left", padx=(4, 0))
         r += 1
 
         btns = ttk.Frame(self)
@@ -172,6 +187,8 @@ class App(ttk.Frame):
             keep_all=self.keep_all_var.get(),
             keep=self.tags_keep,
             drop=_parse_csv(self.drop_var.get()),
+            embed_lrc=self.embed_lrc_var.get(),
+            embed_txt=self.embed_txt_var.get(),
         )
 
     def _refresh_tags_label(self) -> None:
@@ -189,6 +206,9 @@ class App(ttk.Frame):
             "keep_all": cfg.keep_all,
             "keep": cfg.keep,
             "drop": cfg.drop,
+            "embed_lrc": cfg.embed_lrc,
+            "embed_txt": cfg.embed_txt,
+            "jobs": int(self.jobs_var.get()),
             "overwrite": self.overwrite_var.get(),
             "dst_dir": str(out_dir),
         })
@@ -296,6 +316,10 @@ class App(ttk.Frame):
             f"{len(cfg.keep)} selected" if cfg.keep is not None
             else f"defaults ({len(DEFAULT_KEEP)})")
         lines = [f"{len(files)} file(s) -> .{cfg.fmt} @ {cfg.bitrate_kbps}kbps | tags: {keep}"]
+        embed = [s for s, on in ((".lrc→lyrics", cfg.embed_lrc), (".txt→comment", cfg.embed_txt)) if on]
+        if embed:
+            lines[0] += f" | embed {', '.join(embed)}"
+        lines[0] += f" | {int(self.jobs_var.get())} workers"
         try:
             info = probe(files[0])
             cover = (f"{info.cover_width}x{info.cover_height}"
@@ -321,30 +345,69 @@ class App(ttk.Frame):
         self.status_var.set(f"0/{len(files)}")
         threading.Thread(
             target=self._worker,
-            args=(files, src_root, out_dir, cfg, self.overwrite_var.get()),
+            args=(files, src_root, out_dir, cfg, self.overwrite_var.get(),
+                  int(self.jobs_var.get())),
             daemon=True,
         ).start()
 
+    def _one_line(self, src: Path, out_dir: Path, src_root: Path,
+                  cfg: JobConfig, overwrite: bool) -> str:
+        from pathlib import Path as _P
+
+        rel = src.relative_to(src_root) if src_root.is_dir() else _P(src.name)
+        dst = (out_dir / rel).with_suffix(f".{cfg.fmt}")
+        if dst.exists() and not overwrite:
+            return f"skip (exists): {src.name}\n"
+        res = compress_one(src, dst, cfg, overwrite_sidecars=overwrite)
+        line = (f"ok: {res.dst.name} "
+                f"{res.in_bytes//1024}KB -> {res.out_bytes//1024}KB "
+                f"| {res.cover_note}")
+        if res.sidecar_note:
+            line += f" | embedded {res.sidecar_note}"
+        if res.warnings:
+            line += f" | WARNING (source corrupt?): {res.warnings}"
+        return line + "\n"
+
     def _worker(self, files: list[Path], src_root: Path, out_dir: Path,
-                cfg: JobConfig, overwrite: bool) -> None:
+                cfg: JobConfig, overwrite: bool, jobs: int | None = None) -> None:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        n_workers = default_jobs(jobs)
         done = errors = 0
-        for src in files:
-            try:
-                rel = src.relative_to(src_root) if src_root.is_dir() else Path(src.name)
-                dst = (out_dir / rel).with_suffix(f".{cfg.fmt}")
-                if dst.exists() and not overwrite:
-                    self._queue.put(("log", f"skip (exists): {src.name}\n"))
-                else:
-                    res = compress_one(src, dst, cfg)
-                    self._queue.put(
-                        ("log", f"ok: {res.dst.name} "
-                                f"{res.in_bytes//1024}KB -> {res.out_bytes//1024}KB "
-                                f"| {res.cover_note}\n"))
-                done += 1
-            except Exception as exc:  # per-file errors shouldn't kill the batch
-                errors += 1
-                self._queue.put(("log", f"FAIL {src.name}: {exc}\n"))
-            self._queue.put(("progress", done, len(files)))
+        if n_workers <= 1 or len(files) <= 1:
+            for src in files:
+                try:
+                    self._queue.put(("log", self._one_line(src, out_dir, src_root, cfg, overwrite)))
+                    done += 1
+                except Exception as exc:  # per-file errors shouldn't kill the batch
+                    errors += 1
+                    self._queue.put(("log", f"FAIL {src.name}: {exc}\n"))
+                self._queue.put(("progress", done, len(files)))
+        else:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futs = {pool.submit(
+                    self._one_line, src, out_dir, src_root, cfg, overwrite): src
+                    for src in files}
+                for fut in as_completed(futs):
+                    src = futs[fut]
+                    try:
+                        self._queue.put(("log", fut.result()))
+                        done += 1
+                    except Exception as exc:
+                        errors += 1
+                        self._queue.put(("log", f"FAIL {src.name}: {exc}\n"))
+                    self._queue.put(("progress", done, len(files)))
+        try:
+            skip: set[str] = set()
+            if cfg.embed_lrc:
+                skip.add(".lrc")
+            if cfg.embed_txt:
+                skip.add(".txt")
+            copied = copy_sidecars(src_root, out_dir, overwrite=overwrite, skip_suffixes=skip)
+            if copied:
+                self._queue.put(("log", f"copied {len(copied)} sidecar file(s) (.lrc/.txt)\n"))
+        except Exception as exc:
+            self._queue.put(("log", f"sidecar copy failed: {exc}\n"))
         self._queue.put(("done", done, errors))
 
     # -- ui thread plumbing ---------------------------------------------

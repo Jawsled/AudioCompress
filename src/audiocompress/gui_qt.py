@@ -45,7 +45,13 @@ from . import settings
 from .cover import COVER_PRESETS
 from .extract import collect_tag_summary
 from .metadata_map import DEFAULT_KEEP, detect_batch_format, friendly_label, native_key
-from .pipeline import JobConfig, compress_one, iter_inputs
+from .pipeline import (
+    JobConfig,
+    compress_one,
+    copy_sidecars,
+    default_jobs,
+    iter_inputs,
+)
 from .probe import probe
 
 FORMATS = ["opus", "ogg", "mp3"]
@@ -68,41 +74,81 @@ def _native(path: str) -> str:
 
 
 class CompressWorker(QThread):
-    """Batch runner. Per-file errors are reported, never fatal."""
+    """Batch runner (thread pool). Per-file errors are reported, never fatal."""
 
     message = Signal(str)
     progress = Signal(int, int)
     finished_ok = Signal(int, int)  # done, errors
 
     def __init__(self, files: list[Path], src_root: Path, out_dir: Path,
-                 cfg: JobConfig, overwrite: bool) -> None:
+                 cfg: JobConfig, overwrite: bool, jobs: int | None = None) -> None:
         super().__init__()
         self._files = files
         self._src_root = src_root
         self._out_dir = out_dir
         self._cfg = cfg
         self._overwrite = overwrite
+        self._jobs = default_jobs(jobs)
+
+    def _dst_for(self, src: Path) -> Path:
+        rel = src.relative_to(self._src_root) if self._src_root.is_dir() else Path(src.name)
+        return (self._out_dir / rel).with_suffix(f".{self._cfg.fmt}")
+
+    def _one(self, src: Path) -> str:
+        dst = self._dst_for(src)
+        if dst.exists() and not self._overwrite:
+            return f"skip (exists): {src.name}\n"
+        res = compress_one(src, dst, self._cfg, overwrite_sidecars=self._overwrite)
+        line = (
+            f"ok: {res.dst.name} "
+            f"{res.in_bytes // 1024}KB -> {res.out_bytes // 1024}KB "
+            f"| {res.cover_note}")
+        if res.sidecar_note:
+            line += f" | embedded {res.sidecar_note}"
+        if res.warnings:
+            line += f" | WARNING (source corrupt?): {res.warnings}"
+        return line + "\n"
 
     def run(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         done = errors = 0
         total = len(self._files)
-        for src in self._files:
-            try:
-                rel = src.relative_to(self._src_root) if self._src_root.is_dir() else Path(src.name)
-                dst = (self._out_dir / rel).with_suffix(f".{self._cfg.fmt}")
-                if dst.exists() and not self._overwrite:
-                    self.message.emit(f"skip (exists): {src.name}\n")
-                else:
-                    res = compress_one(src, dst, self._cfg)
-                    self.message.emit(
-                        f"ok: {res.dst.name} "
-                        f"{res.in_bytes // 1024}KB -> {res.out_bytes // 1024}KB "
-                        f"| {res.cover_note}\n")
-                done += 1
-            except Exception as exc:
-                errors += 1
-                self.message.emit(f"FAIL {src.name}: {exc}\n")
-            self.progress.emit(done, total)
+        if self._jobs <= 1 or total <= 1:
+            for src in self._files:
+                try:
+                    self.message.emit(self._one(src))
+                    done += 1
+                except Exception as exc:
+                    errors += 1
+                    self.message.emit(f"FAIL {src.name}: {exc}\n")
+                self.progress.emit(done, total)
+        else:
+            with ThreadPoolExecutor(max_workers=self._jobs) as pool:
+                futs = {pool.submit(self._one, src): src for src in self._files}
+                for fut in as_completed(futs):
+                    src = futs[fut]
+                    try:
+                        self.message.emit(fut.result())
+                        done += 1
+                    except Exception as exc:
+                        errors += 1
+                        self.message.emit(f"FAIL {src.name}: {exc}\n")
+                    self.progress.emit(done, total)
+        try:
+            skip: set[str] = set()
+            if self._cfg.embed_lrc:
+                skip.add(".lrc")
+            if self._cfg.embed_txt:
+                skip.add(".txt")
+            copied = copy_sidecars(
+                self._src_root, self._out_dir,
+                overwrite=self._overwrite, skip_suffixes=skip,
+            )
+            if copied:
+                self.message.emit(f"copied {len(copied)} sidecar file(s) (.lrc/.txt)\n")
+        except Exception as exc:
+            self.message.emit(f"sidecar copy failed: {exc}\n")
         self.finished_ok.emit(done, errors)
 
 
@@ -289,6 +335,32 @@ class MainWindow(QMainWindow):
         self._overwrite.setToolTip("Overwrite existing outputs")
         self._overwrite.setChecked(bool(self._saved.get("overwrite", False)))
         grid.addWidget(self._overwrite, 3, 3)
+        self._embed_lrc = QCheckBox("Embed .lrc → lyrics")
+        self._embed_lrc.setToolTip("Embed same-stem .lrc file into the lyrics tag instead of copying it")
+        self._embed_lrc.setChecked(bool(self._saved.get("embed_lrc", False)))
+        grid.addWidget(self._embed_lrc, 4, 1)
+        self._embed_txt = QCheckBox("Embed .txt → comment")
+        self._embed_txt.setToolTip("Embed same-stem .txt file into the comment tag instead of copying it")
+        self._embed_txt.setChecked(bool(self._saved.get("embed_txt", False)))
+        grid.addWidget(self._embed_txt, 4, 2)
+        sidecars_label = QLabel("Sidecars:")
+        sidecars_label.setToolTip("Tick to embed sidecar files into tags instead of copying them")
+        grid.addWidget(sidecars_label, 4, 0)
+        # Workers label sits directly left of its number: parallel files at once.
+        workers_box = QWidget()
+        workers_row = QHBoxLayout(workers_box)
+        workers_row.setContentsMargins(0, 0, 0, 0)
+        workers_row.setSpacing(6)
+        workers_label = QLabel("Workers:")
+        workers_label.setToolTip("Parallel files converted at once (worker threads). Higher = faster, more CPU/RAM.")
+        workers_row.addWidget(workers_label)
+        self._jobs = QSpinBox()
+        self._jobs.setRange(1, 32)
+        self._jobs.setToolTip("Parallel files converted at once (worker threads). Higher = faster, more CPU/RAM.")
+        self._jobs.setValue(int(self._saved.get("jobs", default_jobs())))
+        workers_row.addWidget(self._jobs)
+        workers_row.addStretch(1)
+        grid.addWidget(workers_box, 4, 3)
         layout.addWidget(opts)
 
         # Actions + progress + log.
@@ -336,6 +408,8 @@ class MainWindow(QMainWindow):
             keep_all=self._keep_all.isChecked(),
             keep=self.tags_keep,
             drop=_parse_csv(self._drop.text()),
+            embed_lrc=self._embed_lrc.isChecked(),
+            embed_txt=self._embed_txt.isChecked(),
         )
 
     def _refresh_tags_label(self) -> None:
@@ -353,6 +427,9 @@ class MainWindow(QMainWindow):
             "keep_all": cfg.keep_all,
             "keep": cfg.keep,
             "drop": cfg.drop,
+            "embed_lrc": cfg.embed_lrc,
+            "embed_txt": cfg.embed_txt,
+            "jobs": int(self._jobs.value()),
             "overwrite": self._overwrite.isChecked(),
             "dst_dir": str(out_dir),
         })
@@ -416,6 +493,10 @@ class MainWindow(QMainWindow):
             f"{len(cfg.keep)} selected" if cfg.keep is not None
             else f"defaults ({len(DEFAULT_KEEP)})")
         lines = [f"{len(files)} file(s) -> .{cfg.fmt} @ {cfg.bitrate_kbps}kbps | tags: {keep}"]
+        embed = [s for s, on in ((".lrc→lyrics", cfg.embed_lrc), (".txt→comment", cfg.embed_txt)) if on]
+        if embed:
+            lines[0] += f" | embed {', '.join(embed)}"
+        lines[0] += f" | {int(self._jobs.value())} workers"
         try:
             info = probe(files[0])
             cover = (f"{info.cover_width}x{info.cover_height}"
@@ -436,7 +517,8 @@ class MainWindow(QMainWindow):
         self._remember(cfg, out_dir)
         src_root = Path(self._src.text().strip())
         self._worker = CompressWorker(files, src_root, out_dir, cfg,
-                                      self._overwrite.isChecked())
+                                      self._overwrite.isChecked(),
+                                      jobs=int(self._jobs.value()))
         self._worker.message.connect(self._log_line)
         self._worker.progress.connect(self._on_progress)
         self._worker.finished_ok.connect(self._on_finished)

@@ -1,7 +1,7 @@
 """Re-embed filtered tags + processed cover via mutagen.
 
-Opus/Ogg: METADATA_BLOCK_PICTURE (base64 Picture block).
-MP3: ID3 text frames + APIC cover frame.
+Opus/Ogg: METADATA_BLOCK_PICTURE (base64 Picture block), LYRICS for lyrics.
+MP3: ID3 text frames + USLT (lyrics) + APIC cover frame.
 Cover bytes are reused as-is — no ffmpeg image re-encode involved.
 """
 
@@ -55,11 +55,15 @@ def _write_vorbis(
         pic.desc = "Cover"
         pic.data = data
         try:  # fill dimensions so players don't have to decode
+            import warnings
+
             from PIL import Image
 
-            with Image.open(io.BytesIO(data)) as im:
-                pic.width, pic.height = im.width, im.height
-                pic.depth = 24
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+                with Image.open(io.BytesIO(data)) as im:
+                    pic.width, pic.height = im.width, im.height
+                    pic.depth = 24
         except Exception:
             pass
         block = pic.write()
@@ -107,6 +111,7 @@ def _write_mp3(
         TPUB,
         TRCK,
         TXXX,
+        USLT,
     )
     from mutagen.mp3 import MP3
 
@@ -139,6 +144,13 @@ def _write_mp3(
             continue
         if k == "comment":
             id3.add(COMM(encoding=3, lang="eng", desc="", text=vals))
+            continue
+        if k in ("lyrics", "lyric", "unsyncedlyrics"):
+            # Synced (.lrc) or plain lyrics embed as USLT so players show it;
+            # drop stale frames first (like APIC handling below).
+            id3.delall("USLT")
+            for v in vals:
+                id3.add(USLT(encoding=3, lang="eng", desc="", text=v))
             continue
         frame_id = _ID3_FRAMES.get(k)
         if frame_id in frame_classes:

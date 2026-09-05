@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
+import warnings
 
 from PIL import Image
 
@@ -11,10 +13,25 @@ COVER_PRESETS = (1000, 800, 600, 500)
 ORIGINAL = 0
 
 
+@contextlib.contextmanager
+def _no_bomb_warning():
+    """Swallow Pillow's DecompressionBombWarning around cover opens.
+
+    Huge embedded covers (e.g. 100MP) trip Pillow's DOS heuristic and print
+    a warning to the console. We downscale to <=max_edge px right away, so
+    the warning is noise — the resulting cover_note already reports the
+    resize. Pixel dimensions are still returned normally.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+        yield
+
+
 def probe_image(data: bytes) -> tuple[str, int, int]:
-    with Image.open(io.BytesIO(data)) as im:
-        fmt = (im.format or "JPEG").upper()
-        return fmt, im.width, im.height
+    with _no_bomb_warning():
+        with Image.open(io.BytesIO(data)) as im:
+            fmt = (im.format or "JPEG").upper()
+            return fmt, im.width, im.height
 
 
 def guess_mime(fmt: str, data: bytes) -> str:
@@ -48,24 +65,32 @@ def process_cover(
         fmt, _, _ = probe_image(data)
         return data, guess_mime(fmt, data), False
 
-    with Image.open(io.BytesIO(data)) as im:
-        fmt = (im.format or "JPEG").upper()
-        w, h = im.width, im.height
-        if max(w, h) <= max_edge:
-            return data, guess_mime(fmt, data), False
-        scale = max_edge / max(w, h)
-        nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
-        im = im.convert("RGB") if fmt in ("JPEG", "JPG") else im
-        # JPEG sources -> RGB; PNG with alpha keeps RGBA until save decision
-        resized = im.resize((nw, nh), Image.LANCZOS)
-        buf = io.BytesIO()
-        if fmt == "PNG":
-            # Keep PNG only if small-ish; here re-save optimized PNG.
-            # If it has no alpha, JPEG is smaller — but stay PNG to avoid
-            # surprise format changes unless caller converts.
-            save_img = resized.convert("RGBA") if "A" in resized.getbands() else resized
-            save_img.save(buf, format="PNG", optimize=True)
-            return buf.getvalue(), "image/png", True
-        rgb = resized.convert("RGB")
-        rgb.save(buf, format="JPEG", quality=quality, optimize=True)
-        return buf.getvalue(), "image/jpeg", True
+    with _no_bomb_warning():
+        with Image.open(io.BytesIO(data)) as im:
+            fmt = (im.format or "JPEG").upper()
+            w, h = im.width, im.height
+            if max(w, h) <= max_edge:
+                return data, guess_mime(fmt, data), False
+            scale = max_edge / max(w, h)
+            nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+            im = im.convert("RGB") if fmt in ("JPEG", "JPG") else im
+            # JPEG sources -> RGB; PNG with alpha keeps RGBA until save decision
+            if scale < 0.25:
+                # Huge downscale (e.g. 100MP -> 1000px): fast BILINEAR to 2x
+                # target, then LANCZOS for the last 2x. Near-identical quality
+                # at a fraction of the CPU of one giant LANCZOS pass.
+                mid = im.resize((nw * 2, nh * 2), Image.BILINEAR)
+                resized = mid.resize((nw, nh), Image.LANCZOS)
+            else:
+                resized = im.resize((nw, nh), Image.LANCZOS)
+            buf = io.BytesIO()
+            if fmt == "PNG":
+                # Keep PNG only if small-ish; here re-save optimized PNG.
+                # If it has no alpha, JPEG is smaller — but stay PNG to avoid
+                # surprise format changes unless caller converts.
+                save_img = resized.convert("RGBA") if "A" in resized.getbands() else resized
+                save_img.save(buf, format="PNG", optimize=True)
+                return buf.getvalue(), "image/png", True
+            rgb = resized.convert("RGB")
+            rgb.save(buf, format="JPEG", quality=quality, optimize=True)
+            return buf.getvalue(), "image/jpeg", True
