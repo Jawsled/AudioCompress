@@ -20,13 +20,31 @@ from .pipeline import (
     compress_one,
     copy_sidecars,
     default_jobs,
+    existing_output,
     iter_inputs,
     iter_sidecars,
+    output_exists,
 )
 from .probe import probe
 
 app = typer.Typer(add_completion=False, help="Compress audio, preserve cover art.")
 console = Console()
+
+
+def _display(s: str) -> str:
+    """Keep a string printable on legacy Windows consoles (e.g. cp1252).
+
+    UTF-8 terminals pass through untouched; when the console encoding can't
+    represent a char (NFD `u + combining diaeresis` on cp1252), fall back to
+    backslash escapes so `console.print` never raises UnicodeEncodeError
+    mid-batch (which previously skipped sidecar copy + settings save).
+    """
+    enc = getattr(console.file, "encoding", None) or "utf-8"
+    try:
+        s.encode(enc)
+        return s
+    except (UnicodeEncodeError, LookupError):
+        return s.encode(enc, "backslashreplace").decode(enc)
 
 FmtOpt = typer.Option(None, "--format", "-f", help="Output format: opus, ogg or mp3 (default: saved setting or opus).")
 BitrateOpt = typer.Option(None, "--bitrate", "-b", help="Audio bitrate kbps, 32-320 (default: saved setting or 160).")
@@ -118,6 +136,7 @@ def file(
     drop: Optional[str] = DropOpt,
     embed_lrc: Optional[bool] = EmbedLrcOpt,
     embed_txt: Optional[bool] = EmbedTxtOpt,
+    overwrite: bool = OverwriteOpt,
     dry_run: bool = DryRunOpt,
 ):
     """Compress a single file."""
@@ -133,6 +152,17 @@ def file(
     if dry_run:
         console.print("[yellow]dry-run: nothing written.[/]")
         return
+    # Duplicate prevention: same stem with any output suffix counts as done.
+    if not overwrite:
+        dup = existing_output(dst)
+        if dup is not None:
+            want, have = _display(Path(dst).name), _display(dup.name)
+            console.print(
+                f"[yellow]skip (exists): {want}"
+                + (f" — already exported as {have}" if have != want else "")
+                + " (use --overwrite).[/]"
+            )
+            return
     res = compress_one(src, dst, cfg, overwrite_sidecars=True)
     _remember(cfg, Path(dst).parent)
     parts = [
@@ -178,7 +208,7 @@ def batch(
         for f in files[:50]:
             info = probe(f)
             table.add_row(
-                f.name, str(info.audio_codec),
+                _display(f.name), str(info.audio_codec),
                 f"{info.cover_width}x{info.cover_height}" if info.has_cover else "-",
             )
         console.print(table)
@@ -199,13 +229,19 @@ def batch(
     warned = sum(1 for r in results if r.warnings)
     embedded = sum(1 for r in results if r.sidecar_note)
     copied = copy_sidecars(src_dir, dst_dir, overwrite=overwrite, skip_suffixes=skip)
+    skipped = 0 if overwrite else len(files) - len(results)
     if results:
         _remember(cfg, dst_dir, n_jobs)
         table = Table("file", "in", "out", "cover", "warning")
         for r in results:
             warn_cells = "; ".join(s for s in (r.warnings, r.sidecar_note) if s) or "-"
-            table.add_row(r.dst.name, f"{r.in_bytes//1024}KB", f"{r.out_bytes//1024}KB", r.cover_note, warn_cells)
+            table.add_row(_display(r.dst.name), f"{r.in_bytes//1024}KB", f"{r.out_bytes//1024}KB", _display(r.cover_note), _display(warn_cells))
         console.print(table)
+        if skipped:
+            console.print(
+                f"[dim]skipped {skipped} file(s) already exported "
+                f"(same name, any .opus/.ogg/.mp3 — use --overwrite).[/]"
+            )
         if warned:
             console.print(
                 f"[yellow]{warned} file(s) had audio decode warnings "
@@ -242,7 +278,7 @@ def tags(
         example = vals[0] if vals else ""
         if len(example) > 60:
             example = example[:57] + "..."
-        table.add_row(key, label, example, "yes" if key in DEFAULT_KEEP else "")
+        table.add_row(key, label, _display(example), "yes" if key in DEFAULT_KEEP else "")
     console.print(f"[dim]{len(files)} file(s) scanned, {len(summary)} distinct tag(s):[/]")
     console.print(table)
 

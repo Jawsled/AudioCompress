@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import settings
+from .chime import play_chime
 from .cover import COVER_PRESETS
 from .extract import collect_tag_summary
 from .metadata_map import DEFAULT_KEEP, detect_batch_format, friendly_label, native_key
@@ -50,6 +51,7 @@ from .pipeline import (
     compress_one,
     copy_sidecars,
     default_jobs,
+    existing_output,
     iter_inputs,
 )
 from .probe import probe
@@ -96,8 +98,11 @@ class CompressWorker(QThread):
 
     def _one(self, src: Path) -> str:
         dst = self._dst_for(src)
-        if dst.exists() and not self._overwrite:
-            return f"skip (exists): {src.name}\n"
+        if not self._overwrite:
+            dup = existing_output(dst)
+            if dup is not None:
+                detail = f" (found {dup.name})" if dup.name != dst.name else ""
+                return f"skip (exists): {src.name}{detail}\n"
         res = compress_one(src, dst, self._cfg, overwrite_sidecars=self._overwrite)
         line = (
             f"ok: {res.dst.name} "
@@ -371,6 +376,10 @@ class MainWindow(QMainWindow):
         self._run_btn = QPushButton("Compress")
         self._run_btn.clicked.connect(self._run)
         row.addWidget(self._run_btn)
+        self._chime = QCheckBox("Chime")
+        self._chime.setToolTip("Play a soft chime when compression finishes")
+        self._chime.setChecked(bool(self._saved.get("chime", True)))
+        row.addWidget(self._chime)
         row.addStretch(1)
         self._status = QLabel("idle")
         row.addWidget(self._status)
@@ -431,6 +440,7 @@ class MainWindow(QMainWindow):
             "embed_txt": cfg.embed_txt,
             "jobs": int(self._jobs.value()),
             "overwrite": self._overwrite.isChecked(),
+            "chime": self._chime.isChecked(),
             "dst_dir": str(out_dir),
         })
 
@@ -536,6 +546,12 @@ class MainWindow(QMainWindow):
         self._run_btn.setEnabled(True)
         self._status.setText(f"done: {done} file(s), {errors} error(s)")
         self._worker = None
+        try:
+            # Distinct generated chime only — never the OS default ding.
+            if self._chime.isChecked():
+                play_chime()
+        except Exception:
+            pass
 
 
 def main() -> int:

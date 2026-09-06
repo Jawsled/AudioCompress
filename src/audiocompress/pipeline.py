@@ -6,6 +6,7 @@ import locale
 import os
 import shutil
 import tempfile
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,11 @@ INPUT_SUFFIXES = {
 
 # Companion files (lyrics, notes, cuesheets-as-text) mirrored verbatim.
 SIDECAR_SUFFIXES = {".lrc", ".txt"}
+
+# Final transcoded outputs. Used for duplicate prevention: a source stem is
+# considered "already exported" if any of these exists in the destination
+# folder, regardless of which one the current run would write.
+OUTPUT_SUFFIXES = {".opus", ".ogg", ".mp3"}
 
 
 @dataclass
@@ -78,17 +84,29 @@ class JobResult:
 MAX_EMBED_CHARS = 100_000
 
 
+def _norm_stem(name: str) -> str:
+    """Canonical stem for same-name comparisons.
+
+    NFC + casefold so matches survive Unicode normalization differences
+    (macOS writes NFD `u + combining diaeresis`, Windows/most tools use NFC
+    `ü` — same album, different bytes) and case differences. Without this,
+    `04. Pür Love.opus` (NFC) doesn't block `04. Pür Love.opus` (NFD) and
+    a look-alike duplicate gets created.
+    """
+    return unicodedata.normalize("NFC", name.casefold())
+
+
 def companion_for(src_file: str | Path, suffix: str) -> Path | None:
     """Same-stem sibling (e.g. song.flac -> song.lrc), or None."""
     src_file = Path(src_file)
-    stem = src_file.stem.lower()
+    stem = _norm_stem(src_file.stem)
     suffix = suffix.lower()
     try:
         siblings = list(src_file.parent.iterdir())
     except OSError:
         return None
     for p in siblings:
-        if p.is_file() and p.suffix.lower() == suffix and p.stem.lower() == stem:
+        if p.is_file() and p.suffix.lower() == suffix and _norm_stem(p.stem) == stem:
             return p
     return None
 
@@ -227,7 +245,7 @@ def iter_sidecars(root: Path) -> list[Path]:
     """
     root = Path(root)
     if root.is_file():
-        stem = root.stem.lower()
+        stem = _norm_stem(root.stem)
         try:
             siblings = list(root.parent.iterdir())
         except OSError:
@@ -237,7 +255,7 @@ def iter_sidecars(root: Path) -> list[Path]:
             for p in siblings
             if p.is_file()
             and p.suffix.lower() in SIDECAR_SUFFIXES
-            and p.stem.lower() == stem
+            and _norm_stem(p.stem) == stem
         )
     return sorted(
         p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in SIDECAR_SUFFIXES
@@ -249,6 +267,48 @@ def _same_file(a: Path, b: Path) -> bool:
         return a.resolve() == b.resolve()
     except OSError:
         return False
+
+
+def existing_output(dst: str | Path) -> Path | None:
+    """Return the already-exported file blocking `dst`, or None.
+
+    Duplicate prevention, ignoring extensions: `dst` is considered done if
+    the exact path exists OR a same-stem sibling with any supported output
+    suffix (opus/ogg/mp3) exists in the same folder. Stem comparison is
+    NFC-normalized + case-insensitive, so `Song.OPUS` blocks `song.opus`
+    and NFC `Pür` blocks NFD `Pür` (macOS vs Windows spellings of ü).
+
+    Only OUTPUT_SUFFIXES count — same-stem `.lrc`/`.txt` sidecars never
+    block a transcode.
+    """
+    dst = Path(dst)
+    if dst.exists():
+        return dst
+    parent = dst.parent
+    try:
+        if not parent.is_dir():
+            return None
+    except OSError:
+        return None
+    stem = _norm_stem(dst.stem)
+    try:
+        entries = list(parent.iterdir())
+    except OSError:
+        return None
+    for p in entries:
+        try:
+            if not p.is_file():
+                continue
+        except OSError:
+            continue
+        if p.suffix.lower() in OUTPUT_SUFFIXES and _norm_stem(p.stem) == stem:
+            return p
+    return None
+
+
+def output_exists(dst: str | Path) -> bool:
+    """True if `dst` or any same-stem output already exists (see existing_output)."""
+    return existing_output(dst) is not None
 
 
 def copy_sidecars_for_file(
@@ -346,7 +406,7 @@ def _compress_one_job(
     src: Path, dst: Path, cfg: JobConfig, overwrite: bool
 ) -> JobResult | None:
     """Single job for the pool; None means skipped (output exists)."""
-    if dst.exists() and not overwrite:
+    if not overwrite and output_exists(dst):
         return None
     return compress_one(src, dst, cfg, overwrite_sidecars=overwrite)
 
@@ -374,7 +434,8 @@ def compress_batch(
     if overwrite:
         todo = pairs
     else:
-        todo = [(s, d) for s, d in pairs if not d.exists()]
+        # Stem-insensitive: skip if dst or any same-stem .opus/.ogg/.mp3 exists.
+        todo = [(s, d) for s, d in pairs if not output_exists(d)]
     results: list[JobResult] = []
     n_workers = default_jobs(jobs)
     if not todo:
@@ -432,6 +493,7 @@ __all__ = [
     "JobConfig",
     "JobResult",
     "MAX_EMBED_CHARS",
+    "OUTPUT_SUFFIXES",
     "SIDECAR_SUFFIXES",
     "collect_embed_tags",
     "companion_for",
@@ -441,8 +503,10 @@ __all__ = [
     "copy_sidecars_for_file",
     "copy_sidecars_batch",
     "default_jobs",
+    "existing_output",
     "iter_inputs",
     "iter_sidecars",
+    "output_exists",
     "probe",
     "read_sidecar_text",
 ]

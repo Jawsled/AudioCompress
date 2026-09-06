@@ -16,10 +16,11 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from . import settings
+from .chime import play_chime
 from .cover import COVER_PRESETS
 from .extract import collect_tag_summary
 from .metadata_map import DEFAULT_KEEP, friendly_label
-from .pipeline import JobConfig, compress_one, copy_sidecars, default_jobs, iter_inputs
+from .pipeline import JobConfig, compress_one, copy_sidecars, default_jobs, existing_output, iter_inputs
 from .probe import probe
 
 COVER_LABELS = ["Original (keep bytes)", *[str(p) for p in sorted(COVER_PRESETS)]]
@@ -141,6 +142,9 @@ class App(ttk.Frame):
         self.preview_btn.pack(side="left", padx=4)
         self.run_btn = ttk.Button(btns, text="Compress", command=self._run)
         self.run_btn.pack(side="left", padx=4)
+        self.chime_var = tk.BooleanVar(value=bool(self._saved.get("chime", True)))
+        self.chime_box = ttk.Checkbutton(btns, text="Chime", variable=self.chime_var)
+        self.chime_box.pack(side="left", padx=4)
         self.status_var = tk.StringVar(value="idle")
         ttk.Label(btns, textvariable=self.status_var).pack(side="right")
         r += 1
@@ -210,6 +214,7 @@ class App(ttk.Frame):
             "embed_txt": cfg.embed_txt,
             "jobs": int(self.jobs_var.get()),
             "overwrite": self.overwrite_var.get(),
+            "chime": self.chime_var.get(),
             "dst_dir": str(out_dir),
         })
 
@@ -356,8 +361,11 @@ class App(ttk.Frame):
 
         rel = src.relative_to(src_root) if src_root.is_dir() else _P(src.name)
         dst = (out_dir / rel).with_suffix(f".{cfg.fmt}")
-        if dst.exists() and not overwrite:
-            return f"skip (exists): {src.name}\n"
+        if not overwrite:
+            dup = existing_output(dst)
+            if dup is not None:
+                detail = f" (found {dup.name})" if dup.name != dst.name else ""
+                return f"skip (exists): {src.name}{detail}\n"
         res = compress_one(src, dst, cfg, overwrite_sidecars=overwrite)
         line = (f"ok: {res.dst.name} "
                 f"{res.in_bytes//1024}KB -> {res.out_bytes//1024}KB "
@@ -427,6 +435,12 @@ class App(ttk.Frame):
                     self._running = False
                     self.run_btn.state(["!disabled"])
                     self.status_var.set(f"done: {done} file(s), {errors} error(s)")
+                    try:
+                        # Distinct generated chime only — never the OS bell.
+                        if self.chime_var.get():
+                            play_chime()
+                    except Exception:
+                        pass
         except queue.Empty:
             pass
         self.root.after(100, self._poll)
